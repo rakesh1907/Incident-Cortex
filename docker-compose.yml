@@ -12,8 +12,9 @@ services:
     container_name: incident-ollama
     volumes:
       - ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
+    # No host port: API reaches ollama at http://ollama:11434 inside the compose network.
+    # Avoids clashing with a Mac/Homebrew Ollama on localhost:11434. To expose Ollama on the host, add:
+    # ports: ["11435:11434"]
     restart: unless-stopped
 
   api:
