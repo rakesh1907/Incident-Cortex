@@ -3,7 +3,9 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -12,6 +14,8 @@ import httpx
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
+
+from integrations.monitoring import start_incident_insight_jobs, stop_incident_insight_jobs
 
 load_dotenv()
 
@@ -27,6 +31,9 @@ JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))
+# Faster path for declare-time draft (title + impact + status in one call, or parallel workers)
+OLLAMA_DRAFT_TIMEOUT = float(os.getenv("OLLAMA_DRAFT_TIMEOUT", "45"))
+OLLAMA_USE_SINGLE_DRAFT = os.getenv("OLLAMA_USE_SINGLE_DRAFT", "true").lower() in ("1", "true", "yes")
 
 TRIGGER_EMOJI = "rotating_light"
 
@@ -110,6 +117,10 @@ class IncidentState:
     timeline: list = field(default_factory=list)
     fh_id: str = ""
     resolution_summaries_posted: bool = False
+    # Original command-center message (for RCCA / keyword matching)
+    source_message_text: str = ""
+    # Pending RCCA match: raw doc + metadata until POC chooses Yes (then LLM extract) or No
+    rcca_match_payload: Optional[dict] = None
 
     def add_event(self, text: str, user: str = ""):
         ts = datetime.now().strftime("%I:%M %p")
@@ -264,8 +275,116 @@ def send_message(channel: str, text: str, thread_ts: str = None) -> dict:
     return slack_post("chat.postMessage", payload)
 
 
-def send_blocks(channel: str, text: str, blocks: list) -> dict:
-    return slack_post("chat.postMessage", {"channel": channel, "text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False})
+def send_blocks(channel: str, text: str, blocks: list, thread_ts: str = None) -> dict:
+    payload: dict = {"channel": channel, "text": text, "blocks": blocks, "unfurl_links": False, "unfurl_media": False}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    return slack_post("chat.postMessage", payload)
+
+
+def send_ephemeral(channel: str, user_id: str, text: str) -> dict:
+    return slack_post("chat.postEphemeral", {"channel": channel, "user": user_id, "text": text})
+
+
+def _post_rcca_owner_prompt(inc: IncidentState, match: dict) -> None:
+    """Notify POC in the incident channel as a standalone message (not threaded under the brief)."""
+    if not inc.inc_channel_id:
+        return
+    inc.rcca_match_payload = {**match}
+    src = match.get("source_file_name") or "RCCA records"
+    score = match.get("similarity_score")
+    score_h = f" _(relevance {score})_" if score is not None else ""
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"📬 <@{inc.commander_id}> I found a *relevant past incident* in our RCCA library "
+                    f"(`{src}`){score_h}, similar to this one.\n\n"
+                    "Would you like me to *fetch a summary and possible solutions* from that incident and post them here?\n\n"
+                    "_Nothing is fetched until you choose._"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"rcca_{inc.number}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Yes, fetch summary"},
+                    "style": "primary",
+                    "action_id": "rcca_share_yes",
+                    "value": f"{inc.number}|{inc.fh_id}|rcca_yes",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "No"},
+                    "action_id": "rcca_share_no",
+                    "value": f"{inc.number}|{inc.fh_id}|rcca_no",
+                },
+            ],
+        },
+    ]
+    send_blocks(
+        inc.inc_channel_id,
+        "Similar past incident — your choice",
+        blocks,
+    )
+
+
+def _rcca_feature_enabled() -> bool:
+    """RCCA lookup runs if a local sync folder is set OR Google Drive API mode is enabled."""
+    from integrations.gdrive_rcca import _gdrive_enabled
+    from integrations.local_rcca import local_rcca_configured
+
+    return local_rcca_configured() or _gdrive_enabled()
+
+
+def _rcca_background_lookup(inc_number: str) -> None:
+    from integrations.gdrive_rcca import search_similar_rcca
+
+    if not _rcca_feature_enabled():
+        return
+    inc = incidents.get(str(inc_number))
+    if not inc:
+        return
+    match = search_similar_rcca(
+        title=inc.title,
+        message_text=inc.source_message_text or "",
+        thread_context=inc.thread_context or "",
+        impact_summary=inc.impact_summary,
+        ollama_model=OLLAMA_MODEL,
+        ollama_host=OLLAMA_HOST,
+        ollama_generate_fn=llm_generate,
+    )
+    inc = incidents.get(str(inc_number))
+    if not match or not inc:
+        return
+    if inc.rcca_match_payload is not None:
+        return
+    _post_rcca_owner_prompt(inc, match)
+
+
+def _nr_background_monitor(inc_number: str, stop_ev: threading.Event) -> None:
+    from integrations.newrelic_data import _nr_enabled, fetch_live_incident_snapshot_safe
+
+    if not _nr_enabled():
+        return
+    interval = max(60, int(os.getenv("NR_MONITOR_INTERVAL_SEC", "300")))
+    while not stop_ev.is_set():
+        inc = incidents.get(str(inc_number))
+        if not inc or inc.status == "resolved":
+            break
+        svc = ""
+        if isinstance(inc.impact_summary, dict):
+            svc = str(inc.impact_summary.get("service") or "")
+        text = fetch_live_incident_snapshot_safe(svc or "production")
+        if text and inc.inc_channel_id and inc.brief_message_ts:
+            send_message(inc.inc_channel_id, text, thread_ts=inc.brief_message_ts)
+        if stop_ev.wait(timeout=interval):
+            break
 
 
 def update_blocks(channel: str, ts: str, text: str, blocks: list) -> dict:
@@ -298,14 +417,27 @@ def invite_user(channel_id: str, user_id: str):
 # Ollama LLM
 # ═══════════════════════════════════════════════
 
-def llm_generate(prompt: str, timeout: Optional[float] = None) -> str:
+def llm_generate(
+    prompt: str,
+    timeout: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
     """Call Ollama; try /api/generate then /api/chat (Llama 3+ often fills `message.content` only on chat)."""
     t = timeout if timeout is not None else OLLAMA_TIMEOUT
     base = OLLAMA_HOST.rstrip("/")
+    gen_body: dict = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+    chat_body: dict = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    if max_tokens is not None:
+        gen_body["options"] = {"num_predict": max_tokens}
+        chat_body["options"] = {"num_predict": max_tokens}
     try:
         r = httpx.post(
             f"{base}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            json=gen_body,
             timeout=t,
         )
         data = r.json() if r.content else {}
@@ -320,11 +452,7 @@ def llm_generate(prompt: str, timeout: Optional[float] = None) -> str:
 
         r2 = httpx.post(
             f"{base}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-            },
+            json=chat_body,
             timeout=t,
         )
         d2 = r2.json() if r2.content else {}
@@ -343,24 +471,110 @@ def llm_generate(prompt: str, timeout: Optional[float] = None) -> str:
     return ""
 
 
-def generate_title(message: str, context: str = "") -> str:
+def _parse_incident_draft_block(raw: str) -> Optional[tuple[str, dict, str]]:
+    """Parse single-call SRE draft (TITLE/SCOPE/SERVICE/USER_IMPACT/SYMPTOMS/STATUS lines)."""
+    data: dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        key, _, rest = line.partition(":")
+        k = key.strip().upper().replace(" ", "_").strip("*_")
+        val = rest.strip().strip("*")
+        if k in ("USER_IMPACT", "USERIMPACT") or (k.startswith("USER") and "IMPACT" in k):
+            data["USER_IMPACT"] = val
+        elif k in ("TITLE", "SCOPE", "SERVICE", "SYMPTOMS", "STATUS"):
+            data[k] = val
+    title = (data.get("TITLE") or "").strip().strip('"').strip("'")
+    if len(title) < 3:
+        return None
+    impact = {
+        "scope": (data.get("SCOPE") or "Assessing").strip() or "Assessing",
+        "service": (data.get("SERVICE") or "Unknown").strip() or "Unknown",
+        "user_impact": (data.get("USER_IMPACT") or "Under investigation").strip() or "Under investigation",
+        "symptoms": (data.get("SYMPTOMS") or "Under investigation").strip() or "Under investigation",
+    }
+    status = (data.get("STATUS") or "Investigation in progress.").strip() or "Investigation in progress."
+    return title, impact, status
+
+
+def generate_incident_draft_fast(message: str, context: str = "") -> Optional[tuple[str, dict, str]]:
+    """One Ollama round-trip for title + impact + status (much faster than 3 sequential calls)."""
+    ctx = (context or "")[:2200]
+    msg = (message or "")[:2200]
+    block = f"Thread (excerpt):\n{ctx}\n\nPrimary message:\n{msg}" if ctx.strip() else f"Message:\n{msg}"
+    prompt = (
+        "You are an SRE. From the incident text below, output EXACTLY 6 lines. "
+        "Each line must start with one of these keywords, a colon, then a space, then the value. "
+        "Use the keyword exactly as written.\n"
+        "TITLE: <5-8 words, no quotes>\n"
+        "SCOPE: <Global|Regional|Local or best guess>\n"
+        "SERVICE: <affected system or Unknown>\n"
+        "USER_IMPACT: <one sentence>\n"
+        "SYMPTOMS: <one sentence>\n"
+        "STATUS: <one sentence for stakeholders>\n"
+        "No other lines. No markdown.\n\n"
+        f"{block}"
+    )
+    raw = llm_generate(prompt, timeout=OLLAMA_DRAFT_TIMEOUT, max_tokens=320)
+    parsed = _parse_incident_draft_block(raw)
+    if not parsed:
+        print("[Ollama] Combined draft parse failed, falling back to parallel calls.")
+    return parsed
+
+
+def generate_incident_draft_parallel(message: str, context: str = "") -> tuple[str, dict, str]:
+    """Three LLM calls at once (helps when single-call format fails; still faster than sequential)."""
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_title = pool.submit(
+            generate_title, message, context, OLLAMA_DRAFT_TIMEOUT, 80
+        )
+        f_impact = pool.submit(
+            generate_impact, message, context, OLLAMA_DRAFT_TIMEOUT, 200
+        )
+        f_status = pool.submit(
+            generate_status_summary, message, context, OLLAMA_DRAFT_TIMEOUT, 120
+        )
+        title = f_title.result()
+        impact = f_impact.result()
+        status_summary = f_status.result()
+    return title, impact, status_summary
+
+
+def generate_title(
+    message: str,
+    context: str = "",
+    llm_timeout: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
     full = f"Thread:\n{context}\n\nMessage:\n{message}" if context else message
+    t = llm_timeout if llm_timeout is not None else OLLAMA_DRAFT_TIMEOUT
     result = llm_generate(
         "You are an SRE incident manager. Generate a concise incident title in 5-7 words. "
-        f"Return ONLY the title.\n\n{full}"
+        f"Return ONLY the title.\n\n{full}",
+        timeout=t,
+        max_tokens=max_tokens or 96,
     )
     return result or "Incident reported via Slack"
 
 
-def generate_impact(message: str, context: str = "") -> dict:
+def generate_impact(
+    message: str,
+    context: str = "",
+    llm_timeout: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> dict:
     full = f"{message}\n{context}" if context else message
+    t = llm_timeout if llm_timeout is not None else OLLAMA_DRAFT_TIMEOUT
     result = llm_generate(
         "Based on this incident, respond with EXACTLY 4 lines, no labels, no bullets:\n"
         "Line 1: Scope (Global/Regional/Local)\n"
         "Line 2: Affected service name\n"
         "Line 3: User impact in one sentence\n"
         "Line 4: Key symptom in one sentence\n\n"
-        f"{full}"
+        f"{full}",
+        timeout=t,
+        max_tokens=max_tokens or 220,
     )
     lines = [l.strip() for l in result.split("\n") if l.strip()]
     return {
@@ -412,11 +626,19 @@ def generate_resolution_summaries(inc: IncidentState) -> tuple[str, str]:
     )
 
 
-def generate_status_summary(message: str, context: str = "") -> str:
+def generate_status_summary(
+    message: str,
+    context: str = "",
+    llm_timeout: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
     full = f"{message}\n{context}" if context else message
+    t = llm_timeout if llm_timeout is not None else OLLAMA_DRAFT_TIMEOUT
     result = llm_generate(
         "Summarize this incident in one concise sentence for a status update. "
-        f"Return ONLY the sentence.\n\n{full}"
+        f"Return ONLY the sentence.\n\n{full}",
+        timeout=t,
+        max_tokens=max_tokens or 120,
     )
     return result or "Investigation in progress."
 
@@ -805,7 +1027,57 @@ async def slack_interactivity(req: Request):
     value = action.get("value", "")
     user = payload.get("user", {})
     user_name = user.get("real_name", user.get("username", "Unknown"))
+    user_id_slack = user.get("id", "")
     channel_id = payload.get("channel", {}).get("id", "")
+
+    # ── RCCA share (POC only) — before status/severity routing ──
+    if action_id in ("rcca_share_yes", "rcca_share_no"):
+        parts = value.split("|", 2)
+        if len(parts) != 3:
+            return Response(status_code=200)
+        inc_num, fh_id, _dec = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        rcc_inc = incidents.get(inc_num) or incidents_by_fh_id.get(fh_id)
+        if not rcc_inc:
+            try:
+                rcc_inc = incidents.get(str(int(inc_num)))
+            except ValueError:
+                pass
+        if not rcc_inc:
+            return Response(status_code=200)
+        if not rcc_inc.rcca_match_payload:
+            if user_id_slack:
+                send_ephemeral(channel_id, user_id_slack, "This RCCA prompt was already answered or is no longer valid.")
+            return Response(status_code=200)
+        if user_id_slack and user_id_slack != rcc_inc.commander_id:
+            send_ephemeral(channel_id, user_id_slack, "Only the incident owner (POC) can confirm RCCA sharing.")
+            return Response(status_code=200)
+
+        from integrations.gdrive_rcca import _extract_rcca_fields, build_rcca_summary_blocks
+
+        if action_id == "rcca_share_yes":
+            pay = dict(rcc_inc.rcca_match_payload)
+            raw = (pay.get("rcca_raw_doc_text") or "").strip()
+            if raw:
+                fields = _extract_rcca_fields(raw, llm_generate)
+                merged = {
+                    **fields,
+                    "source_file_name": pay.get("source_file_name", "RCCA"),
+                    "similarity_score": pay.get("similarity_score"),
+                }
+            else:
+                merged = pay
+            if rcc_inc.inc_channel_id:
+                blocks = build_rcca_summary_blocks(merged)
+                send_blocks(
+                    rcc_inc.inc_channel_id,
+                    "Related past incident (RCCA summary)",
+                    blocks,
+                )
+            rcc_inc.add_event("📎 Past RCCA summary & fixes fetched and shared (POC confirmed)", user_name)
+        else:
+            pass
+        rcc_inc.rcca_match_payload = None
+        return Response(status_code=200)
 
     inc, new_value = resolve_incident_from_action_value(value)
     if not inc:
@@ -869,6 +1141,7 @@ async def slack_interactivity(req: Request):
 
     if new_status == "resolved":
         inc.add_event("🎉 Incident resolved", user_name)
+        stop_incident_insight_jobs(str(inc.number))
 
     fh_ok = True
     if inc.fh_id:
@@ -991,20 +1264,39 @@ async def slack_events(req: Request):
 
     thread_context = get_thread_context(channel, message_ts)
 
-    send_message(channel, "🤖 Incident detected! Generating AI title and creating incident...", message_ts)
+    send_message(channel, "🤖 Incident detected! Generating AI brief and creating incident...", message_ts)
 
-    # ── 2. AI generation ──
-    title = generate_title(message_text, thread_context)
-    impact = generate_impact(message_text, thread_context)
-    status_summary = generate_status_summary(message_text, thread_context)
+    # ── 2. AI generation (one combined Ollama call by default — ~3× faster than 3 sequential calls)
+    title: str
+    impact: dict
+    status_summary: str
+    if OLLAMA_USE_SINGLE_DRAFT:
+        bundle = generate_incident_draft_fast(message_text, thread_context)
+        if bundle:
+            title, impact, status_summary = bundle
+        else:
+            title, impact, status_summary = generate_incident_draft_parallel(message_text, thread_context)
+    else:
+        title, impact, status_summary = generate_incident_draft_parallel(message_text, thread_context)
     title_slug = slugify(title)
 
-    # ── 3. FireHydrant ──
+    # ── 3. FireHydrant + Jira in parallel (independent HTTP; saves wall-clock vs sequential)
     who_line = f"Raised by {poc_name}"
     if poc_user_id != reactor_id:
         who_line += f", declared by {reactor_name}"
     summary = f"{who_line}. {message_text}"[:250]
-    fh = fh_create_incident(title, summary)
+    jira_lines = [f"POC / Request raised by: {poc_name}", f"Message: {message_text}"]
+    if poc_user_id != reactor_id:
+        jira_lines.insert(1, f"Incident declared by (emoji): {reactor_name}")
+    jira_lines.append(f"Thread:\n{thread_context}")
+    jira_desc = "\n\n".join(jira_lines)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_fh = pool.submit(fh_create_incident, title, summary)
+        fut_jira = pool.submit(create_jira_ticket, title, jira_desc)
+        fh = fut_fh.result()
+        jira = fut_jira.result()
+
     if not fh.get("id"):
         send_message(channel, f"⚠️ FireHydrant error: {fh.get('messages', fh.get('error'))}", message_ts)
         return {"ok": True}
@@ -1012,14 +1304,6 @@ async def slack_events(req: Request):
     inc_number = fh.get("number", incident_counter + 1000)
     incident_counter += 1
     incident_url = fh.get("incident_url", f"https://app.firehydrant.io/incidents/{fh['id']}")
-
-    # ── 4. Jira ──
-    jira_lines = [f"POC / Request raised by: {poc_name}", f"Message: {message_text}"]
-    if poc_user_id != reactor_id:
-        jira_lines.insert(1, f"Incident declared by (emoji): {reactor_name}")
-    jira_lines.append(f"Thread:\n{thread_context}")
-    jira_desc = "\n\n".join(jira_lines)
-    jira = create_jira_ticket(title, jira_desc)
 
     # ── 5. Slack channel ──
     date_str = datetime.now().strftime("%Y%m%d")
@@ -1043,6 +1327,7 @@ async def slack_events(req: Request):
         impact_summary=impact,
         current_status_text=status_summary,
         thread_context=thread_context,
+        source_message_text=message_text,
         source_channel=channel,
         source_message_ts=message_ts,
         thread_permalink=thread_permalink,
@@ -1079,16 +1364,24 @@ async def slack_events(req: Request):
             to_invite.append(reactor_id)
         invite_user(inc_channel_id, ",".join(to_invite))
 
-    # ── 9. Post updatable brief in incident channel ──
+    # ── 9–10. Post brief + #incident announcement in parallel (two Slack posts)
+    ann_blocks = build_announcement_blocks(inc)
     if inc_channel_id:
         blocks = build_incident_brief(inc)
-        resp = send_blocks(inc_channel_id, f"INC-{inc_number}: {title}", blocks)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_brief = pool.submit(
+                send_blocks, inc_channel_id, f"INC-{inc_number}: {title}", blocks
+            )
+            fut_ann = pool.submit(
+                send_blocks, SLACK_INCIDENT_CHANNEL_ID, f"🚨 INC-{inc_number}: {title}", ann_blocks
+            )
+            resp = fut_brief.result()
+            ann_resp = fut_ann.result()
         inc.brief_message_ts = resp.get("ts", "")
-
-    # ── 10. Post announcement in #incident ──
-    ann_blocks = build_announcement_blocks(inc)
-    ann_resp = send_blocks(SLACK_INCIDENT_CHANNEL_ID, f"🚨 INC-{inc_number}: {title}", ann_blocks)
-    inc.announcement_ts = ann_resp.get("ts", "")
+        inc.announcement_ts = ann_resp.get("ts", "")
+    else:
+        ann_resp = send_blocks(SLACK_INCIDENT_CHANNEL_ID, f"🚨 INC-{inc_number}: {title}", ann_blocks)
+        inc.announcement_ts = ann_resp.get("ts", "")
 
     send_message(
         SLACK_INCIDENT_CHANNEL_ID,
@@ -1113,6 +1406,15 @@ async def slack_events(req: Request):
         message_ts,
     )
 
+    # ── Optional: Google Drive RCCA lookup + New Relic interval monitor (non-blocking) ──
+    _inc_key = str(inc_number)
+    start_incident_insight_jobs(
+        _inc_key,
+        get_incident=lambda k=_inc_key: incidents.get(k),
+        run_rcca_lookup=lambda k=_inc_key: _rcca_background_lookup(k),
+        run_nr_monitor=lambda ev, k=_inc_key: _nr_background_monitor(k, ev),
+    )
+
     return {"ok": True}
 
 
@@ -1124,11 +1426,32 @@ def health():
     except Exception:
         pass
 
+    gdrive_on = os.getenv("GDRIVE_RCCA_ENABLED", "").lower() in ("1", "true", "yes")
+    nr_on = os.getenv("NEW_RELIC_ENABLED", "").lower() in ("1", "true", "yes")
+
+    from integrations.gdrive_rcca import _ollama_embed, _rcca_embed_model
+    from integrations.local_rcca import check_local_rcca_connectivity
+
+    rcca_local = check_local_rcca_connectivity()
+    rcca_mode = "local_folder" if rcca_local.get("configured") and rcca_local.get("is_dir") else None
+    if not rcca_mode and gdrive_on:
+        rcca_mode = "drive_api"
+
+    rcca_embed_ok: Optional[bool] = None
+    if ollama_ok and rcca_mode and rcca_mode != "off":
+        em = _rcca_embed_model(os.getenv("OLLAMA_MODEL", "llama3"))
+        rcca_embed_ok = _ollama_embed("health", em, OLLAMA_HOST) is not None
+
     return {
         "server": "running",
         "ollama": "connected" if ollama_ok else "disconnected",
         "slack": "configured" if SLACK_BOT_TOKEN else "missing",
         "firehydrant": "configured" if FIREHYDRANT_API_KEY else "missing",
         "jira": "configured" if JIRA_API_TOKEN else "missing",
+        "gdrive_rcca": "enabled" if gdrive_on else "off",
+        "rcca_local_folder": rcca_local,
+        "rcca_lookup": rcca_mode or "off",
+        "rcca_ollama_embeddings": rcca_embed_ok,
+        "new_relic_monitor": "enabled" if nr_on else "off",
         "active_incidents": len(incidents),
     }

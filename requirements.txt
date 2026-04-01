@@ -4,3 +4,6 @@ requests
 python-dotenv
 httpx
 python-multipart
+google-auth
+google-api-python-client
+pypdf
