@@ -239,7 +239,7 @@ docker compose exec ollama ollama pull nomic-embed-text   # optional; good for R
 - **API:** [http://localhost:8000/health](http://localhost:8000/health)  
 - **Slack:** still needs a public URL → run `ngrok http 8000` on your machine and set Event / Interactivity URLs to `https://…/slack/events` and `…/slack/interactivity`.
 
-`docker-compose.yml` sets `OLLAMA_HOST=http://ollama:11434` for the API service (overrides `OLLAMA_HOST` in `.env` while using Compose). Your `OLLAMA_MODEL` / `OLLAMA_EMBED_MODEL` values in `.env` still apply.
+`docker-compose.yml` sets `OLLAMA_HOST=http://ollama:11434` for the API service (overrides `OLLAMA_HOST` in `.env` while using Compose). Your `OLLAMA_MODEL` / `OLLAMA_EMBED_MODEL` values in `.env` still apply. The **Ollama container is not published on the host’s port 11434**, so it can run alongside **Homebrew Ollama** on your Mac without a port clash. To expose container Ollama on the host, add `ports: ["11435:11434"]` under the `ollama` service.
 
 **RCCA files in Docker:** uncomment the `volumes` block under `api` in `docker-compose.yml`, put PDFs/text in `./rcca-library` on the host, and set `RCCA_LOCAL_FOLDER=/data/rcca` in `.env`.
 
