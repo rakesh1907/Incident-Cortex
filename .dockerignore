@@ -1,0 +1,14 @@
+.venv
+venv
+__pycache__
+*.py[cod]
+.git
+.gitignore
+.env
+*.log
+.DS_Store
+.pytest_cache
+.mypy_cache
+*.egg-info
+.cursor
+assets

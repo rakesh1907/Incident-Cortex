@@ -216,7 +216,47 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 Avoid `uvicorn --workers 2+` unless you add a shared store (Redis/DB).
 
-### 4. Slack app configuration
+### 4. Run with Docker (share the same stack with your team)
+
+You can run the **API and Ollama** together so teammates only need Docker Desktop (Mac/Windows) or Docker Engine (Linux), plus a filled-in `.env`.
+
+**Prerequisites:** [Docker Compose](https://docs.docker.com/compose/install/) v2+ (included with Docker Desktop on Mac).
+
+```bash
+cp .env.example .env
+# Edit .env: Slack, FireHydrant, Jira, channel IDs (same as local run).
+
+docker compose up --build -d
+```
+
+Pull models **once** into the Ollama container (first run can take several minutes):
+
+```bash
+docker compose exec ollama ollama pull llama3
+docker compose exec ollama ollama pull nomic-embed-text   # optional; good for RCCA embeddings
+```
+
+- **API:** [http://localhost:8000/health](http://localhost:8000/health)  
+- **Slack:** still needs a public URL → run `ngrok http 8000` on your machine and set Event / Interactivity URLs to `https://…/slack/events` and `…/slack/interactivity`.
+
+`docker-compose.yml` sets `OLLAMA_HOST=http://ollama:11434` for the API service (overrides `OLLAMA_HOST` in `.env` while using Compose). Your `OLLAMA_MODEL` / `OLLAMA_EMBED_MODEL` values in `.env` still apply.
+
+**RCCA files in Docker:** uncomment the `volumes` block under `api` in `docker-compose.yml`, put PDFs/text in `./rcca-library` on the host, and set `RCCA_LOCAL_FOLDER=/data/rcca` in `.env`.
+
+**Google Drive service account JSON:** mount the file and set e.g. `GOOGLE_APPLICATION_CREDENTIALS=/data/creds.json` plus an extra volume in `docker-compose.yml`.
+
+**API only (Ollama already on the Mac via Homebrew):** run the app with plain Docker and point at the host:
+
+```bash
+docker build -t incident-api .
+docker run --rm -p 8000:8000 --env-file .env \
+  -e OLLAMA_HOST=http://host.docker.internal:11434 \
+  incident-api
+```
+
+(On Linux without `host.docker.internal`, use `--add-host=host.docker.internal:host-gateway` with recent Docker, or set `OLLAMA_HOST` to your host IP.)
+
+### 5. Slack app configuration
 
 | Setting | URL |
 |--------|-----|
@@ -229,7 +269,7 @@ Typical OAuth scopes include: `channels:history`, `channels:read`, `channels:man
 
 For local dev, use **ngrok** (or similar) and paste the HTTPS URL into Slack.
 
-### 5. Install Ollama model
+### 6. Install Ollama model (local / non-Docker)
 
 ```bash
 ollama pull llama3
@@ -267,6 +307,9 @@ ollama pull llama3
 │   ├── newrelic_data.py   # NerdGraph NRQL helpers
 │   └── monitoring.py      # Background RCCA + NR threads
 ├── requirements.txt
+├── Dockerfile             # container image for the FastAPI app
+├── docker-compose.yml     # api + Ollama for team demos
+├── .dockerignore
 ├── .env.example           # template — safe to commit
 ├── .env                   # not committed — your secrets
 ├── scripts/

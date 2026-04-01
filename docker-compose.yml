@@ -1,0 +1,37 @@
+# Full stack for local / team demos: API + Ollama in containers.
+# Usage:
+#   cp .env.example .env   # fill secrets
+#   docker compose up --build -d
+#   docker compose exec ollama ollama pull llama3
+#   docker compose exec ollama ollama pull nomic-embed-text   # optional RCCA embeddings
+# Then expose port 8000 (e.g. ngrok http 8000) for Slack Event URLs.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: incident-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: incident-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override host when both services run in Compose:
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    # Optional: mount a host folder of RCCA PDFs/text (set RCCA_LOCAL_FOLDER=/data/rcca in .env)
+    # volumes:
+    #   - ./rcca-library:/data/rcca:ro
+
+volumes:
+  ollama_data:
