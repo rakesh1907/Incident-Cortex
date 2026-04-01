@@ -1,10 +1,15 @@
-# Full stack for local / team demos: API + Ollama in containers.
+# Full stack: API + Ollama (+ optional ngrok tunnel for Slack).
 # Usage:
-#   cp .env.example .env   # fill secrets
+#   cp .env.example .env   # fill secrets, including NGROK_AUTHTOKEN for tunnel profile
 #   docker compose up --build -d
 #   docker compose exec ollama ollama pull llama3
 #   docker compose exec ollama ollama pull nomic-embed-text   # optional RCCA embeddings
-# Then expose port 8000 (e.g. ngrok http 8000) for Slack Event URLs.
+#
+# Slack HTTPS URL via ngrok in Docker (set NGROK_AUTHTOKEN in .env):
+#   docker compose --profile ngrok up -d
+#   Open http://localhost:4040 → copy the https forwarding URL for Slack Event + Interactivity:
+#     https://<subdomain>.ngrok-free.app/slack/events
+#     https://<subdomain>.ngrok-free.app/slack/interactivity
 
 services:
   ollama:
@@ -33,6 +38,25 @@ services:
     # Optional: mount a host folder of RCCA PDFs/text (set RCCA_LOCAL_FOLDER=/data/rcca in .env)
     # volumes:
     #   - ./rcca-library:/data/rcca:ro
+
+  # Public tunnel to the API for Slack (reads NGROK_AUTHTOKEN from .env via Compose interpolation).
+  # Start with: docker compose --profile ngrok up -d
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: incident-ngrok
+    profiles:
+      - ngrok
+    restart: unless-stopped
+    command:
+      - "http"
+      - "http://api:8000"
+    environment:
+      NGROK_AUTHTOKEN: "${NGROK_AUTHTOKEN}"
+    ports:
+      - "4040:4040"
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   ollama_data:

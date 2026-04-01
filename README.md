@@ -238,7 +238,12 @@ docker compose exec ollama ollama pull nomic-embed-text   # optional; good for R
 ```
 
 - **API:** [http://localhost:8000/health](http://localhost:8000/health)  
-- **Slack:** still needs a public URL → run **`bash scripts/ngrok-start.sh`** (uses **`NGROK_AUTHTOKEN`** in `.env`) and set Event / Interactivity URLs to `https://…/slack/events` and `…/slack/interactivity`.
+- **Slack / public HTTPS:** set **`NGROK_AUTHTOKEN`** in `.env`, then either:
+  - **ngrok in Docker** (forwards to the `api` container):  
+    `docker compose --profile ngrok up -d`  
+    Open **[http://localhost:4040](http://localhost:4040)** (ngrok inspect UI) → copy the **https** forwarding URL → Slack **Event Subscriptions** and **Interactivity**:  
+    `https://<your-subdomain>.ngrok-free.app/slack/events` and `…/slack/interactivity`
+  - **ngrok on the Mac host** (forwards to localhost:8000): **`bash scripts/ngrok-start.sh`**
 
 `docker-compose.yml` sets `OLLAMA_HOST=http://ollama:11434` for the API service (overrides `OLLAMA_HOST` in `.env` while using Compose). Your `OLLAMA_MODEL` / `OLLAMA_EMBED_MODEL` values in `.env` still apply. The **Ollama container is not published on the host’s port 11434**, so it can run alongside **Homebrew Ollama** on your Mac without a port clash. To expose container Ollama on the host, add `ports: ["11435:11434"]` under the `ollama` service.
 
@@ -309,7 +314,7 @@ ollama pull llama3
 │   └── monitoring.py      # Background RCCA + NR threads
 ├── requirements.txt
 ├── Dockerfile             # container image for the FastAPI app
-├── docker-compose.yml     # api + Ollama for team demos
+├── docker-compose.yml     # api + Ollama; optional ngrok (--profile ngrok)
 ├── .dockerignore
 ├── .env.example           # template — safe to commit
 ├── .env                   # not committed — your secrets
