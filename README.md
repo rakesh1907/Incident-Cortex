@@ -268,7 +268,7 @@ Subscribe to bot event: **`reaction_added`**.
 
 Typical OAuth scopes include: `channels:history`, `channels:read`, `channels:manage`, `chat:write`, `reactions:read`, `users:read`, `usergroups:read` (as needed), and any scope required to **create channels** and **invite users** your workspace uses.
 
-For local dev, use **ngrok** (or similar) and paste the HTTPS URL into Slack.
+For local dev, use **`bash scripts/ngrok-start.sh`** (or plain ngrok) and paste the HTTPS URL into Slack.
 
 ### 6. Install Ollama model (local / non-Docker)
 
